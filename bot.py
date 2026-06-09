@@ -189,6 +189,10 @@ TEXTS = {
         "uz": "🕐 Qachon eslatib qo'yay?\nMasalan: `bugun 15:00` yoki `ertaga 9:00`",
         "ko": "🕐 언제 알려드릴까요?\n예: `오늘 15:00` 또는 `내일 오전 9시`",
     },
+    "updated": {
+        "uz": "✏️ *Yangilandi!*\n🕐 Yangi vaqt: *{time}*\n📋 Ish: *{task}*",
+        "ko": "✏️ *수정되었습니다!*\n🕐 새 시간: *{time}*\n📋 일정: *{task}*",
+    },
     "weekly_saved": {
         "uz": "🔁 *Haftalik eslatma saqlandi!*\n📅 {day} {time}\n📋 {task}",
         "ko": "🔁 *매주 반복 알림이 저장되었습니다!*\n📅 {day} {time}\n📋 {task}",
@@ -234,11 +238,16 @@ Rules:
 - Month/Day format like "5/26" or "6/3" means that month and day of year {now.year}
 - Day-of-week markers like (월), (화), (수), (목), (금), (토), (일) are hints — use the date, not the weekday
 - Bullet points (•, -, *, ·) each represent a separate reminder — extract ALL of them
+- If user wants to MODIFY/MOVE a reminder (바꿔줘, 변경, 수정, 옮겨줘, 이동):
+  use "action": "update", "old_task": exact original task name, "old_date": original date (YYYY-MM-DD) if mentioned
+  Keep task name EXACTLY as the original — do NOT change or append anything to it
+  If only the date changes (time not mentioned), return "time": "00:00" — system will preserve original time
+- Default for new reminders: omit "action" field
 
 Return JSON array format EXACTLY like this:
 [
   {{"date": "YYYY-MM-DD", "time": "HH:MM", "task": "task description"}},
-  {{"date": "YYYY-MM-DD", "time": "HH:MM", "task": "another task"}}
+  {{"action": "update", "old_task": "original task", "old_date": "YYYY-MM-DD", "date": "YYYY-MM-DD", "time": "HH:MM", "task": "original task"}}
 ]
 
 If message contains multiple items/schedules, extract ALL of them.
@@ -500,17 +509,43 @@ async def save_reminders(update: Update, cid: int, parsed_list: list):
         tz = get_tz(cid)
         now = datetime.now(tz)
         saved_count = 0
+        updated_count = 0
+        last_saved = None
+        last_updated = None
 
         for parsed in parsed_list:
+            action = parsed.get("action", "add")
+
+            if action == "update":
+                old_task = parsed.get("old_task", "")
+                old_date = parsed.get("old_date", "")
+                original_time = None
+                original_task = None
+
+                for i, r in enumerate(db["reminders"]):
+                    if r["chat_id"] != cid or r.get("done"):
+                        continue
+                    task_match = old_task and (old_task in r["task"] or r["task"] in old_task)
+                    date_match = not old_date or r["time"].startswith(old_date)
+                    if task_match and date_match:
+                        original_time = r["time"][11:16]
+                        original_task = r["task"]
+                        db["reminders"].pop(i)
+                        break
+
+                if parsed.get("time") == "00:00" and original_time:
+                    parsed["time"] = original_time
+                task = original_task or old_task or parsed["task"]
+            else:
+                task = parsed["task"]
+
             remind_dt = datetime.strptime(
                 f"{parsed['date']} {parsed['time']}", "%Y-%m-%d %H:%M"
             ).replace(tzinfo=tz)
 
-            # Vaqt o'tib ketgan bo'lsa — ertaga saqla
-            if parsed.get("time", "00:00") != "00:00" and remind_dt <= now:
+            if parsed.get("time") != "00:00" and remind_dt <= now:
                 remind_dt += timedelta(days=1)
 
-            task = parsed["task"]
             reminder_dict = {
                 "chat_id": cid,
                 "time": remind_dt.strftime("%Y-%m-%d %H:%M"),
@@ -527,12 +562,24 @@ async def save_reminders(update: Update, cid: int, parsed_list: list):
             )
             if not is_duplicate:
                 db["reminders"].append(reminder_dict)
-                saved_count += 1
+                if action == "update":
+                    updated_count += 1
+                    last_updated = (remind_dt, task)
+                else:
+                    saved_count += 1
+                    last_saved = parsed
 
         save_data(db)
 
-        if saved_count == 1:
-            first = parsed_list[0]
+        total = saved_count + updated_count
+        if updated_count >= 1 and saved_count == 0:
+            dt, task = last_updated
+            await update.message.reply_text(
+                t("updated", cid, time=dt.strftime("%Y-%m-%d %H:%M"), task=task),
+                parse_mode="Markdown"
+            )
+        elif saved_count == 1 and updated_count == 0:
+            first = last_saved
             remind_dt = datetime.strptime(
                 f"{first['date']} {first['time']}", "%Y-%m-%d %H:%M"
             )
@@ -542,9 +589,9 @@ async def save_reminders(update: Update, cid: int, parsed_list: list):
                   task=first["task"]),
                 parse_mode="Markdown"
             )
-        elif saved_count > 1:
+        elif total > 1:
             await update.message.reply_text(
-                f"✅ *{saved_count}ta eslatma saqlandi!*\n(또는 {saved_count}개의 일정이 저장되었습니다)",
+                f"✅ *{total}ta eslatma saqlandi!*\n(또는 {total}개의 일정이 저장되었습니다)",
                 parse_mode="Markdown"
             )
     except Exception as e:
