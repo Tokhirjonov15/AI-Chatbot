@@ -185,6 +185,10 @@ TEXTS = {
         "uz": "🤔 Vaqtni aniqlay olmadim. Misol:\n`Bugun 14:00da uchrashuv` yoki `Ertaga soat 9da shifokor`",
         "ko": "🤔 시간을 파악하지 못했어요. 예시:\n`오늘 14시에 약속` 또는 `내일 오전 9시 병원`",
     },
+    "ask_time": {
+        "uz": "🕐 Qachon eslatib qo'yay?\nMasalan: `bugun 15:00` yoki `ertaga 9:00`",
+        "ko": "🕐 언제 알려드릴까요?\n예: `오늘 15:00` 또는 `내일 오전 9시`",
+    },
     "weekly_saved": {
         "uz": "🔁 *Haftalik eslatma saqlandi!*\n📅 {day} {time}\n📋 {task}",
         "ko": "🔁 *매주 반복 알림이 저장되었습니다!*\n📅 {day} {time}\n📋 {task}",
@@ -216,7 +220,7 @@ async def ai_parse_reminders(user_text: str, cid: int) -> list[dict] | None:
     now = now_for(cid)
     now_str = now.strftime("%Y-%m-%d %H:%M")
 
-    system_prompt = f"""You are a reminder time extractor. Current date and time: {now_str}.
+    system_prompt = f"""You are a reminder time extractor. Current date and time: {now_str}. Current year: {now.year}.
 Extract ALL reminders/schedules from the user message and return ONLY valid JSON array.
 
 Rules:
@@ -227,7 +231,9 @@ Rules:
 - "오전" = AM, "오후" = PM (add 12 if PM and hour < 12)
 - "시" after number = hour (e.g. "3시" = 03:00, "오후 3시" = 15:00)
 - If NO time mentioned for an item, use "00:00" (full day event)
-- Month/Day format like "5/26" means May 26
+- Month/Day format like "5/26" or "6/3" means that month and day of year {now.year}
+- Day-of-week markers like (월), (화), (수), (목), (금), (토), (일) are hints — use the date, not the weekday
+- Bullet points (•, -, *, ·) each represent a separate reminder — extract ALL of them
 
 Return JSON array format EXACTLY like this:
 [
@@ -259,7 +265,7 @@ Return ONLY the JSON array, nothing else."""
                 {"role": "user", "content": user_text}
             ],
             "temperature": 0.3,
-            "max_tokens": 500
+            "max_tokens": 1000
         }
         
         async with httpx.AsyncClient(timeout=15) as client:
@@ -481,6 +487,64 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── MAIN MESSAGE HANDLER (natural language) ──────────────────────────────────
 
 
+async def save_reminders(update: Update, cid: int, parsed_list: list):
+    try:
+        db = load_data()
+        tz = get_tz(cid)
+        now = datetime.now(tz)
+        saved_count = 0
+
+        for parsed in parsed_list:
+            remind_dt = datetime.strptime(
+                f"{parsed['date']} {parsed['time']}", "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=tz)
+
+            # Vaqt o'tib ketgan bo'lsa — ertaga saqla
+            if parsed.get("time", "00:00") != "00:00" and remind_dt <= now:
+                remind_dt += timedelta(days=1)
+
+            task = parsed["task"]
+            reminder_dict = {
+                "chat_id": cid,
+                "time": remind_dt.strftime("%Y-%m-%d %H:%M"),
+                "task": task,
+                "done": False,
+                "weekly": False,
+                "tz": get_user(cid).get("tz", DEFAULT_TZ_KEY),
+            }
+
+            is_duplicate = any(
+                e["chat_id"] == cid and e["time"] == reminder_dict["time"]
+                and e["task"] == task and not e.get("done")
+                for e in db["reminders"]
+            )
+            if not is_duplicate:
+                db["reminders"].append(reminder_dict)
+                saved_count += 1
+
+        save_data(db)
+
+        if saved_count == 1:
+            first = parsed_list[0]
+            remind_dt = datetime.strptime(
+                f"{first['date']} {first['time']}", "%Y-%m-%d %H:%M"
+            )
+            await update.message.reply_text(
+                t("saved", cid,
+                  time=remind_dt.strftime("%Y-%m-%d %H:%M"),
+                  task=first["task"]),
+                parse_mode="Markdown"
+            )
+        elif saved_count > 1:
+            await update.message.reply_text(
+                f"✅ *{saved_count}ta eslatma saqlandi!*\n(또는 {saved_count}개의 일정이 저장되었습니다)",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Save error: {e}")
+        await update.message.reply_text(t("not_understood", cid))
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     text = update.message.text or ""
@@ -504,8 +568,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         })
         save_data(db)
         waiting_for.pop(cid, None)
-        day_name = DAYS_KO[weekday] if get_lang(
-            cid) == "ko" else DAYS_UZ[weekday]
+        day_name = DAYS_KO[weekday] if get_lang(cid) == "ko" else DAYS_UZ[weekday]
         await update.message.reply_text(
             t("weekly_saved", cid, day=day_name,
               time=f"{hour:02d}:{minute:02d}", task=task),
@@ -513,61 +576,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Vaqt so'rash oqimi — oldingi xabarda vaqt yo'q edi
+    if isinstance(state, dict) and state.get("type") == "ask_time":
+        original_task = state["task"]
+        waiting_for.pop(cid, None)
+        combined = f"{original_task} {text}"
+        parsed_list = await ai_parse_reminders(combined, cid)
+        if parsed_list:
+            await save_reminders(update, cid, parsed_list)
+        else:
+            await update.message.reply_text(t("not_understood", cid))
+        return
+
     # Natural language — AI bilan tahlil qilish
     parsed_list = await ai_parse_reminders(text, cid)
 
     if parsed_list:
-        try:
-            db = load_data()
-            tz = get_tz(cid)
-            saved_count = 0
-            
-            for parsed in parsed_list:
-                remind_dt = datetime.strptime(
-                    f"{parsed['date']} {parsed['time']}", "%Y-%m-%d %H:%M"
-                ).replace(tzinfo=tz)
-                task = parsed["task"]
-
-                reminder_dict = {
-                    "chat_id": cid,
-                    "time": remind_dt.strftime("%Y-%m-%d %H:%M"),
-                    "task": task,
-                    "done": False,
-                    "weekly": False,
-                    "tz": get_user(cid).get("tz", DEFAULT_TZ_KEY),
-                }
-                
-                # Check duplicate - bu reminder avval saqlandi yo'qmi?
-                is_duplicate = False
-                for existing in db["reminders"]:
-                    if (existing["chat_id"] == cid and 
-                        existing["time"] == reminder_dict["time"] and 
-                        existing["task"] == task and 
-                        not existing.get("done")):
-                        is_duplicate = True
-                        break
-                
-                if not is_duplicate:
-                    db["reminders"].append(reminder_dict)
-                    saved_count += 1
-            
-            save_data(db)
-            
-            if saved_count == 1:
-                await update.message.reply_text(
-                    t("saved", cid, time=parsed_list[0]['time'], task=parsed_list[0]["task"]),
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text(
-                    f"✅ *{saved_count}ta eslatma saqlandi!*\n(또는 {saved_count}개의 일정이 저장되었습니다)",
-                    parse_mode="Markdown"
-                )
-        except Exception as e:
-            logger.error(f"Save error: {e}")
-            await update.message.reply_text(t("not_understood", cid))
+        await save_reminders(update, cid, parsed_list)
     else:
-        await update.message.reply_text(t("not_understood", cid))
+        # Vaqt topilmadi — foydalanuvchidan so'ra
+        waiting_for[cid] = {"type": "ask_time", "task": text}
+        await update.message.reply_text(t("ask_time", cid), parse_mode="Markdown")
 
 # ─── SCHEDULER ────────────────────────────────────────────────────────────────
 
