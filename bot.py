@@ -347,6 +347,13 @@ waiting_for = {}
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    db = load_data()
+    db["reminders"] = [r for r in db["reminders"] if r["chat_id"] != cid]
+    db.setdefault("users", {}).pop(str(cid), None)
+    save_data(db)
+    waiting_for.pop(cid, None)
+
     kb = [[
         InlineKeyboardButton("🇺🇿 O'zbek", callback_data="lang_uz"),
         InlineKeyboardButton("🇰🇷 한국어",  callback_data="lang_ko"),
